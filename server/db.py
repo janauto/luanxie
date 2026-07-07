@@ -1,0 +1,279 @@
+"""SQLite 薄封装:WAL 连接、schema、CRUD。单写者(worker 串行),无需连接池。"""
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+
+from . import config
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS captures (
+  id            TEXT PRIMARY KEY,
+  type          TEXT NOT NULL CHECK (type IN ('text','audio','image')),
+  status        TEXT NOT NULL DEFAULT 'pending',
+  raw_text      TEXT,
+  media_path    TEXT,
+  transcript    TEXT,
+  clean_text    TEXT,
+  topic_id      TEXT REFERENCES topics(id),
+  confidence    TEXT,
+  suggestion    TEXT,
+  error         TEXT,
+  retry_count   INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  processed_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS topics (
+  id               TEXT PRIMARY KEY,
+  title            TEXT NOT NULL UNIQUE,
+  summary          TEXT NOT NULL DEFAULT '',
+  body_md          TEXT NOT NULL DEFAULT '',
+  tags             TEXT NOT NULL DEFAULT '[]',
+  version          INTEGER NOT NULL DEFAULT 0,
+  exported_version INTEGER NOT NULL DEFAULT 0,
+  export_filename  TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS topic_versions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  topic_id    TEXT NOT NULL REFERENCES topics(id),
+  version     INTEGER NOT NULL,
+  body_md     TEXT NOT NULL,
+  capture_id  TEXT,
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS processing_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  capture_id  TEXT NOT NULL,
+  stage       TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  detail      TEXT,
+  created_at  TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts USING fts5(
+  topic_id UNINDEXED, title, summary, tags
+);
+
+CREATE INDEX IF NOT EXISTS idx_captures_status ON captures(status);
+CREATE INDEX IF NOT EXISTS idx_captures_created ON captures(created_at DESC);
+"""
+
+_conn: sqlite3.Connection | None = None
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_conn() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA foreign_keys=ON")
+        _conn.executescript(SCHEMA)
+    return _conn
+
+
+def _rows(cur) -> list[dict]:
+    return [dict(r) for r in cur.fetchall()]
+
+
+# ---------- captures ----------
+
+def create_capture(type_: str, raw_text: str | None = None,
+                   media_path: str | None = None) -> dict:
+    conn = get_conn()
+    cap = {
+        "id": uuid.uuid4().hex[:12],
+        "type": type_,
+        "status": "pending",
+        "raw_text": raw_text,
+        "media_path": media_path,
+        "created_at": now(),
+    }
+    conn.execute(
+        "INSERT INTO captures (id, type, status, raw_text, media_path, created_at)"
+        " VALUES (:id, :type, :status, :raw_text, :media_path, :created_at)", cap)
+    conn.commit()
+    return get_capture(cap["id"])
+
+
+def get_capture(capture_id: str) -> dict | None:
+    cur = get_conn().execute("SELECT * FROM captures WHERE id=?", (capture_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_captures(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_conn()
+    if status:
+        cur = conn.execute(
+            "SELECT * FROM captures WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (status, limit, offset))
+    else:
+        cur = conn.execute(
+            "SELECT * FROM captures ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset))
+    return _rows(cur)
+
+
+def update_capture(capture_id: str, **fields) -> None:
+    conn = get_conn()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE captures SET {cols} WHERE id=?",
+                 (*fields.values(), capture_id))
+    conn.commit()
+
+
+def delete_capture(capture_id: str) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM captures WHERE id=?", (capture_id,))
+    conn.commit()
+
+
+def pending_captures() -> list[dict]:
+    """非终态的 captures,启动时重新入队用。"""
+    cur = get_conn().execute(
+        "SELECT * FROM captures WHERE status NOT IN "
+        "('done','failed','awaiting_review','rejected') ORDER BY created_at")
+    return _rows(cur)
+
+
+# ---------- topics ----------
+
+def create_topic(title: str, summary: str = "") -> dict:
+    conn = get_conn()
+    tid = uuid.uuid4().hex[:12]
+    ts = now()
+    try:
+        conn.execute(
+            "INSERT INTO topics (id, title, summary, created_at, updated_at)"
+            " VALUES (?,?,?,?,?)", (tid, title, summary, ts, ts))
+        conn.execute(
+            "INSERT INTO topics_fts (topic_id, title, summary, tags) VALUES (?,?,?,?)",
+            (tid, title, summary, "[]"))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # title UNIQUE:并发/重试时复用已有主题
+        conn.rollback()
+        return get_topic_by_title(title)
+    return get_topic(tid)
+
+
+def get_topic(topic_id: str) -> dict | None:
+    row = get_conn().execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_topic_by_title(title: str) -> dict | None:
+    row = get_conn().execute("SELECT * FROM topics WHERE title=?", (title,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_topics(q: str | None = None) -> list[dict]:
+    conn = get_conn()
+    if q:
+        cur = conn.execute(
+            "SELECT t.* FROM topics t JOIN topics_fts f ON t.id=f.topic_id"
+            " WHERE topics_fts MATCH ? ORDER BY t.updated_at DESC", (q,))
+    else:
+        cur = conn.execute(
+            "SELECT id, title, summary, tags, version, exported_version,"
+            " created_at, updated_at FROM topics ORDER BY updated_at DESC")
+    return _rows(cur)
+
+
+def topic_candidates(query_text: str, limit: int = 30) -> list[dict]:
+    """FTS5 预筛候选主题(主题多时用);查询词取正文的非标点词。"""
+    words = [w for w in "".join(
+        c if c.isalnum() else " " for c in query_text).split() if len(w) > 1]
+    if not words:
+        return []
+    match = " OR ".join(f'"{w}"' for w in words[:20])
+    try:
+        cur = get_conn().execute(
+            "SELECT t.* FROM topics t JOIN topics_fts f ON t.id=f.topic_id"
+            " WHERE topics_fts MATCH ? LIMIT ?", (match, limit))
+        return _rows(cur)
+    except sqlite3.OperationalError:
+        return []
+
+
+def update_topic(topic_id: str, capture_id: str | None, *, title: str,
+                 summary: str, body_md: str, tags: list[str]) -> dict:
+    """快照旧版本后写入新内容,version+1,同步 FTS。"""
+    conn = get_conn()
+    old = get_topic(topic_id)
+    ts = now()
+    conn.execute(
+        "INSERT INTO topic_versions (topic_id, version, body_md, capture_id, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (topic_id, old["version"], old["body_md"], capture_id, ts))
+    conn.execute(
+        "UPDATE topics SET title=?, summary=?, body_md=?, tags=?, version=version+1,"
+        " updated_at=? WHERE id=?",
+        (title, summary, body_md, json.dumps(tags, ensure_ascii=False), ts, topic_id))
+    conn.execute("DELETE FROM topics_fts WHERE topic_id=?", (topic_id,))
+    conn.execute(
+        "INSERT INTO topics_fts (topic_id, title, summary, tags) VALUES (?,?,?,?)",
+        (topic_id, title, summary, json.dumps(tags, ensure_ascii=False)))
+    conn.commit()
+    return get_topic(topic_id)
+
+
+def list_topic_versions(topic_id: str) -> list[dict]:
+    cur = get_conn().execute(
+        "SELECT * FROM topic_versions WHERE topic_id=? ORDER BY version DESC",
+        (topic_id,))
+    return _rows(cur)
+
+
+def get_topic_version(topic_id: str, version: int) -> dict | None:
+    row = get_conn().execute(
+        "SELECT * FROM topic_versions WHERE topic_id=? AND version=?",
+        (topic_id, version)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_exported(topic_id: str, version: int, filename: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE topics SET exported_version=?, export_filename=? WHERE id=?",
+        (version, filename, topic_id))
+    conn.commit()
+
+
+def topics_to_export() -> list[dict]:
+    cur = get_conn().execute(
+        "SELECT * FROM topics WHERE version > exported_version")
+    return _rows(cur)
+
+
+def all_tags() -> list[str]:
+    tags: set[str] = set()
+    for row in get_conn().execute("SELECT tags FROM topics"):
+        tags.update(json.loads(row["tags"]))
+    return sorted(tags)
+
+
+# ---------- processing log ----------
+
+def log(capture_id: str, stage: str, status: str, detail: str | None = None) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO processing_log (capture_id, stage, status, detail, created_at)"
+        " VALUES (?,?,?,?,?)", (capture_id, stage, status, detail, now()))
+    conn.commit()
+
+
+def logs_for(capture_id: str) -> list[dict]:
+    cur = get_conn().execute(
+        "SELECT * FROM processing_log WHERE capture_id=? ORDER BY id", (capture_id,))
+    return _rows(cur)

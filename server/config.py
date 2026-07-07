@@ -1,0 +1,41 @@
+"""集中配置:环境变量、路径、模型名。"""
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
+DATA_DIR = PROJECT_ROOT / "data"
+MEDIA_DIR = DATA_DIR / "media"
+DB_PATH = DATA_DIR / "luanxie.db"
+WEB_DIST = PROJECT_ROOT / "web" / "dist"
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "claude-haiku-4-5")
+MERGE_MODEL = os.getenv("MERGE_MODEL", "claude-opus-4-8")
+
+# 置信度阈值:达到该级别及以上的分类结果自动合并,低于则进 awaiting_review。
+# 可选 high / medium / low;设为 low 即全自动。
+AUTO_MERGE_CONFIDENCE = os.getenv("AUTO_MERGE_CONFIDENCE", "high")
+
+VAULT_EXPORT_DIR = Path(
+    os.getenv(
+        "VAULT_EXPORT_DIR",
+        "/Users/linxiansheng/Library/Mobile Documents/"
+        "iCloud~md~obsidian/Documents/OBVault/乱写",
+    )
+)
+
+# 定期导出间隔(分钟);0 = 关闭,仅手动导出
+EXPORT_INTERVAL_MINUTES = int(os.getenv("EXPORT_INTERVAL_MINUTES", "0"))
+
+# 主题数少于该值时全量清单进 prompt,否则用 FTS5 预筛
+TOPIC_LIST_FULL_LIMIT = 150
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8787"))
+
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)

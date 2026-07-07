@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.luanxie.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/linxiansheng/Desktop/乱写/scripts/run.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/linxiansheng/Desktop/乱写</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/luanxie.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/luanxie.err.log</string>
+</dict>
+</plist>
